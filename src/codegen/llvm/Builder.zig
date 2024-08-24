@@ -3994,7 +3994,6 @@ pub const Function = struct {
     names: [*]const String = &[0]String{},
     value_indices: [*]const u32 = &[0]u32{},
     strip: bool,
-    any_nosanitize: bool,
     debug_locations: std.AutoHashMapUnmanaged(Instruction.Index, DebugLocation) = .{},
     debug_values: []const Instruction.Index = &.{},
     extra: []const u32 = &.{},
@@ -4091,7 +4090,6 @@ pub const Function = struct {
             block,
             br,
             br_cond,
-            br_cond_nosanitize,
             call,
             @"call fast",
             cmpxchg,
@@ -4347,13 +4345,6 @@ pub const Function = struct {
                     else => unreachable,
                 };
             }
-
-            pub fn isNosanitize(self: Tag) bool {
-                return switch (self) {
-                    .br_cond_nosanitize => true,
-                    else => false,
-                };
-            }
         };
 
         pub const Index = enum(u32) {
@@ -4376,7 +4367,6 @@ pub const Function = struct {
                 return switch (wip.instructions.items(.tag)[@intFromEnum(self)]) {
                     .br,
                     .br_cond,
-                    .br_cond_nosanitize,
                     .ret,
                     .@"ret void",
                     .@"switch",
@@ -4390,7 +4380,6 @@ pub const Function = struct {
                 return switch (wip.instructions.items(.tag)[@intFromEnum(self)]) {
                     .br,
                     .br_cond,
-                    .br_cond_nosanitize,
                     .fence,
                     .ret,
                     .@"ret void",
@@ -4481,7 +4470,6 @@ pub const Function = struct {
                     .block => .label,
                     .br,
                     .br_cond,
-                    .br_cond_nosanitize,
                     .fence,
                     .ret,
                     .@"ret void",
@@ -4668,7 +4656,6 @@ pub const Function = struct {
                     .block => .label,
                     .br,
                     .br_cond,
-                    .br_cond_nosanitize,
                     .fence,
                     .ret,
                     .@"ret void",
@@ -5101,7 +5088,6 @@ pub const WipFunction = struct {
     instructions: std.MultiArrayList(Instruction),
     names: std.ArrayListUnmanaged(String),
     strip: bool,
-    any_nosanitize: bool,
     debug_locations: std.AutoArrayHashMapUnmanaged(Instruction.Index, DebugLocation),
     debug_values: std.AutoArrayHashMapUnmanaged(Instruction.Index, void),
     extra: std.ArrayListUnmanaged(u32),
@@ -5148,7 +5134,6 @@ pub const WipFunction = struct {
             .instructions = .{},
             .names = .{},
             .strip = options.strip,
-            .any_nosanitize = false,
             .debug_locations = .{},
             .debug_values = .{},
             .extra = .{},
@@ -5217,33 +5202,10 @@ pub const WipFunction = struct {
         then: Block.Index,
         @"else": Block.Index,
     ) Allocator.Error!Instruction.Index {
-        return brCondTag(self, cond, then, @"else", .br_cond);
-    }
-
-    pub fn brCondNosanitize(
-        self: *WipFunction,
-        cond: Value,
-        then: Block.Index,
-        @"else": Block.Index,
-    ) Allocator.Error!Instruction.Index {
-        self.any_nosanitize = true;
-        return brCondTag(self, cond, then, @"else", .br_cond_nosanitize);
-    }
-
-    pub fn brCondTag(
-        self: *WipFunction,
-        cond: Value,
-        then: Block.Index,
-        @"else": Block.Index,
-        /// Asserted to be either `.br_cond` or `.br_cond_nosanitize`.
-        tag: Instruction.Tag,
-    ) Allocator.Error!Instruction.Index {
         assert(cond.typeOfWip(self) == .i1);
-        assert(tag == .br_cond or tag == .br_cond_nosanitize);
-        assert(tag != .br_cond_nosanitize or self.any_nosanitize);
         try self.ensureUnusedExtraCapacity(1, Instruction.BrCond, 0);
         const instruction = try self.addInst(null, .{
-            .tag = tag,
+            .tag = .br_cond,
             .data = self.addExtraAssumeCapacity(Instruction.BrCond{
                 .cond = cond,
                 .then = then,
@@ -6412,7 +6374,7 @@ pub const WipFunction = struct {
                     .@"ret void",
                     .@"unreachable",
                     => {},
-                    .br_cond, .br_cond_nosanitize => {
+                    .br_cond => {
                         const extra = self.extraData(Instruction.BrCond, instruction.data);
                         instruction.data = wip_extra.addExtra(Instruction.BrCond{
                             .cond = instructions.map(extra.cond),
@@ -6597,7 +6559,6 @@ pub const WipFunction = struct {
         function.names = names.ptr;
         function.value_indices = value_indices.ptr;
         function.strip = self.strip;
-        function.any_nosanitize = self.any_nosanitize;
         function.debug_locations = debug_locations;
         function.debug_values = debug_values;
     }
@@ -7736,7 +7697,6 @@ pub const MetadataString = enum(u32) {
 
 pub const Metadata = enum(u32) {
     none = 0,
-    empty_tuple = 1,
     _,
 
     const first_forward_reference = 1 << 29;
@@ -8498,7 +8458,6 @@ pub fn init(options: Options) Allocator.Error!Builder {
 
     try self.metadata_string_indices.append(self.gpa, 0);
     assert(try self.metadataString("") == .none);
-    assert(try self.debugTuple(&.{}) == .empty_tuple);
 
     return self;
 }
@@ -8896,7 +8855,6 @@ pub fn addFunctionAssumeCapacity(
             .kind = .{ .function = function_index },
         }),
         .strip = undefined,
-        .any_nosanitize = false,
     });
     return function_index;
 }
@@ -9544,12 +9502,6 @@ pub fn printUnbuffered(
             });
         }
         if (function.instructions.len > 0) {
-            const maybe_empty_tuple: ?u32 = if (!function.any_nosanitize) null else b: {
-                const gop = try metadata_formatter.map.getOrPut(self.gpa, .{
-                    .metadata = .empty_tuple,
-                });
-                break :b @intCast(gop.index);
-            };
             var block_incoming_len: u32 = undefined;
             try writer.writeAll(" {\n");
             var maybe_dbg_index: ?u32 = null;
@@ -9725,14 +9677,6 @@ pub fn printUnbuffered(
                         });
                     },
                     .br_cond => {
-                        const extra = function.extraData(Function.Instruction.BrCond, instruction.data);
-                        try writer.print("  br {%}, {%}, {%}", .{
-                            extra.cond.fmt(function_index, self),
-                            extra.then.toInst(&function).fmt(function_index, self),
-                            extra.@"else".toInst(&function).fmt(function_index, self),
-                        });
-                    },
-                    .br_cond_nosanitize => {
                         const extra = function.extraData(Function.Instruction.BrCond, instruction.data);
                         try writer.print("  br {%}, {%}, {%}", .{
                             extra.cond.fmt(function_index, self),
@@ -10007,9 +9951,6 @@ pub fn printUnbuffered(
 
                 if (maybe_dbg_index) |dbg_index| {
                     try writer.print(", !dbg !{}", .{dbg_index});
-                }
-                if (instruction.tag.isNosanitize()) {
-                    try writer.print(", !nosanitize !{d}", .{maybe_empty_tuple.?});
                 }
                 try writer.writeByte('\n');
             }
@@ -14745,7 +14686,7 @@ pub fn toBitcode(self: *Builder, allocator: Allocator) bitcode_writer.Error![]co
                                 .block = data,
                             });
                         },
-                        .br_cond, .br_cond_nosanitize => {
+                        .br_cond => {
                             const extra = func.extraData(Function.Instruction.BrCond, data);
                             try function_block.writeAbbrev(FunctionBlock.BrConditional{
                                 .then_block = @intFromEnum(extra.then),
@@ -14895,34 +14836,17 @@ pub fn toBitcode(self: *Builder, allocator: Allocator) bitcode_writer.Error![]co
                 }
 
                 // METADATA_ATTACHMENT_BLOCK
-                if (!func.strip or func.any_nosanitize) {
+                if (!func.strip) blk: {
+                    const dbg = func.global.ptrConst(self).dbg;
+                    if (dbg == .none) break :blk;
+
                     const MetadataAttachmentBlock = ir.MetadataAttachmentBlock;
                     var metadata_attach_block = try function_block.enterSubBlock(MetadataAttachmentBlock, false);
 
-                    if (!func.strip) blk: {
-                        const dbg = func.global.ptrConst(self).dbg;
-                        if (dbg == .none) break :blk;
-                        try metadata_attach_block.writeAbbrev(MetadataAttachmentBlock.AttachmentGlobalSingle{
-                            .kind = .dbg,
-                            .metadata = @enumFromInt(metadata_adapter.getMetadataIndex(dbg) - 1),
-                        });
-                    }
-
-                    var instr_index: u32 = 0;
-                    for (func.instructions.items(.tag)) |instr_tag| switch (instr_tag) {
-                        .arg, .block => {},
-                        .br_cond_nosanitize => {
-                            try metadata_attach_block.writeAbbrev(MetadataAttachmentBlock.AttachmentInstructionSingle{
-                                .inst = instr_index,
-                                .kind = .nosanitize,
-                                .metadata = @enumFromInt(metadata_adapter.getMetadataIndex(.empty_tuple) - 1),
-                            });
-                            instr_index += 1;
-                        },
-                        else => {
-                            instr_index += 1;
-                        },
-                    };
+                    try metadata_attach_block.writeAbbrev(MetadataAttachmentBlock.AttachmentGlobalSingle{
+                        .kind = .dbg,
+                        .metadata = @enumFromInt(metadata_adapter.getMetadataIndex(dbg) - 1),
+                    });
 
                     try metadata_attach_block.end();
                 }
